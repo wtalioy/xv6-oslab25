@@ -1,3 +1,4 @@
+#include "syscall.h"
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
@@ -6,6 +7,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 uint64 sys_exit(void) {
   int n;
@@ -79,5 +81,29 @@ uint64 sys_rename(void) {
   struct proc *p = myproc();
   memmove(p->name, name, len);
   p->name[len] = '\0';
+  return 0;
+}
+
+uint64 sys_trace(void) {
+  int mask;
+  if (argint(0, &mask) < 0) return -1;
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->trace_mask = mask;
+  release(&p->lock);
+  return 0;
+}
+
+uint64 sys_sysinfo(void) {
+  struct proc *p = myproc();
+  struct sysinfo info;
+  uint64 addr;
+  if (argaddr(0, &addr) < 0) return -1;
+
+  memset(&info, 0, sizeof(info));
+  info.freemem = kfree_pages() * PGSIZE;
+  info.nproc = count_unused_procs();
+
+  if (copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0) return -1;
   return 0;
 }

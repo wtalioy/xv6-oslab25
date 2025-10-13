@@ -2,6 +2,7 @@
 // kernel stacks, page-table pages,
 // and pipe buffers. Allocates whole 4096-byte pages.
 
+#include <time.h>
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -67,4 +68,19 @@ void *kalloc(void) {
 
   if (r) memset((char *)r, 5, PGSIZE);  // fill with junk
   return (void *)r;
+}
+
+uint64 kfree_pages(void) {
+  struct run *r;
+  uint64 count = 0;
+
+  acquire(&kmem.lock);
+  r = kmem.freelist;
+  while (r != NULL) {
+    count++;
+    r = r->next;
+  }
+  release(&kmem.lock);
+  
+  return count;
 }
