@@ -64,7 +64,12 @@ void usertrap(void) {
   if (p->killed) exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2) yield();
+  if (which_dev == 2) {
+    if (p->state == RUNNING) {
+      p->time_slice--;
+      if (p->time_slice <= 0) yield();
+    }
+  }
 
   usertrapret();
 }
@@ -141,8 +146,8 @@ void kerneltrap() {
 void clockintr() {
   acquire(&tickslock);
   ticks++;
-  wakeup(&ticks);
   release(&tickslock);
+  wakeup(&ticks);
 }
 
 // check if it's an external interrupt or software interrupt,

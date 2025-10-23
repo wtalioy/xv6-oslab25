@@ -6,6 +6,19 @@
 #include "proc.h"
 #include "defs.h"
 
+uint min_vruntime = 0;
+struct proc *runnable_heap[NPROC];
+struct spinlock heap_lock;
+int heap_size = 0;
+int total_runnable_weight = 0;
+
+const int nice_to_weight[4] = {0, 60, 30, 20};
+
+static void heapify_up(int index);
+static void heapify_down(int index);
+static void heap_insert(struct proc *p);
+static struct proc *heap_pop_min(void);
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -18,7 +31,7 @@ struct spinlock pid_lock;
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
-void update_state(struct proc *p, enum procstate newstate);
+void update_state(struct proc *p, enum procstate newstate, uint current_time);
 
 extern char trampoline[];  // trampoline.S
 
@@ -40,6 +53,7 @@ void procinit(void) {
     p->kstack = va;
   }
   kvminithart();
+  initlock(&heap_lock, "runnable heap");
 }
 
 // Must be called with interrupts disabled,
@@ -117,6 +131,15 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  p->running_time = 0;
+  p->runnable_time = 0;
+  p->sleep_time = 0;
+  acquire(&heap_lock);
+  p->vruntime = min_vruntime;
+  release(&heap_lock);
+  p->time_slice = 0;
+  p->nice = 3;
 
   return p;
 }
@@ -203,6 +226,14 @@ void userinit(void) {
 
   p->state = RUNNABLE;
 
+  acquire(&tickslock);
+  p->last_update_time = ticks;
+  release(&tickslock);
+
+  acquire(&heap_lock);
+  heap_insert(p);
+  release(&heap_lock);
+
   release(&p->lock);
 }
 
@@ -260,6 +291,14 @@ int fork(void) {
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  acquire(&tickslock);
+  np->last_update_time = ticks;
+  release(&tickslock);
+
+  acquire(&heap_lock);
+  heap_insert(np);
+  release(&heap_lock);
 
   np->state = RUNNABLE;
 
@@ -346,7 +385,12 @@ void exit(int status) {
   wakeup1(original_parent);
 
   p->xstate = status;
-  p->state = ZOMBIE;
+
+  acquire(&tickslock);
+  uint current_time = ticks;
+  release(&tickslock);
+
+  update_state(p, ZOMBIE, current_time);
 
   release(&original_parent->lock);
 
@@ -422,26 +466,30 @@ void scheduler(void) {
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&heap_lock);
+    int trw = total_runnable_weight;
+    p = heap_pop_min();
+    release(&heap_lock);
+
+    if (p) {
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-
-        found = 1;
+      if (trw > 0) {
+        p->time_slice = (SCHED_LATENCY_TICKS * nice_to_weight[p->nice]) / trw;
+        if (p->time_slice < MIN_LATENCY_TICKS) p->time_slice = MIN_LATENCY_TICKS;
+      } else {
+        p->time_slice = SCHED_LATENCY_TICKS;
       }
+      acquire(&tickslock);
+      uint current_time = ticks;
+      release(&tickslock);
+      update_state(p, RUNNING, current_time);
+      c->proc = p;
+      swtch(&c->context, &p->context);
+
+      // Process is done running for now.
+      c->proc = 0;
       release(&p->lock);
-    }
-    if (found == 0) {
+    } else {
       intr_on();
       asm volatile("wfi");
     }
@@ -473,7 +521,17 @@ void sched(void) {
 void yield(void) {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
+
+  acquire(&tickslock);
+  uint current_time = ticks;
+  release(&tickslock);
+
+  update_state(p, RUNNABLE, current_time);
+
+  acquire(&heap_lock);
+  heap_insert(p);
+  release(&heap_lock);
+
   sched();
   release(&p->lock);
 }
@@ -515,7 +573,11 @@ void sleep(void *chan, struct spinlock *lk) {
 
   // Go to sleep.
   p->chan = chan;
-  p->state = SLEEPING;
+
+  acquire(&tickslock);
+  uint current_time = ticks;
+  release(&tickslock);
+  update_state(p, SLEEPING, current_time);
 
   sched();
 
@@ -534,10 +596,20 @@ void sleep(void *chan, struct spinlock *lk) {
 void wakeup(void *chan) {
   struct proc *p;
 
+  acquire(&tickslock);
+  uint current_time = ticks;
+  release(&tickslock);
+
   for (p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if (p->state == SLEEPING && p->chan == chan) {
-      p->state = RUNNABLE;
+      acquire(&heap_lock);
+      if (p->vruntime < min_vruntime) {
+        p->vruntime = min_vruntime;
+      }
+      heap_insert(p);
+      release(&heap_lock);
+      update_state(p, RUNNABLE, current_time);
     }
     release(&p->lock);
   }
@@ -548,7 +620,16 @@ void wakeup(void *chan) {
 static void wakeup1(struct proc *p) {
   if (!holding(&p->lock)) panic("wakeup1");
   if (p->chan == p && p->state == SLEEPING) {
-    p->state = RUNNABLE;
+    acquire(&heap_lock);
+    if (p->vruntime < min_vruntime) {
+      p->vruntime = min_vruntime;
+    }
+    heap_insert(p);
+    release(&heap_lock);
+    acquire(&tickslock);
+    uint current_time = ticks;
+    release(&tickslock);
+    update_state(p, RUNNABLE, current_time);
   }
 }
 
@@ -564,7 +645,10 @@ int kill(int pid) {
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
-        p->state = RUNNABLE;
+        acquire(&tickslock);
+        uint current_time = ticks;
+        release(&tickslock);
+        update_state(p, RUNNABLE, current_time);
       }
       release(&p->lock);
       return 0;
@@ -621,7 +705,144 @@ void procdump(void) {
   }
 }
 
+int pstate(int pid, uint64 running_time, uint64 runnable_time, uint64 sleep_time) {
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->pid == pid) {
+      uint ri_time = p->running_time;
+      uint ra_time = p->runnable_time;
+      uint sl_time = p->sleep_time;
+
+      if (p->state != UNUSED && p->state != ZOMBIE) {
+        acquire(&tickslock);
+        uint current_time = ticks;
+        release(&tickslock);
+
+        uint time_diff = current_time - p->last_update_time;
+        switch (p->state) {
+          case RUNNING:
+            ri_time += time_diff;
+            break;
+          case RUNNABLE:
+            ra_time += time_diff;
+            break;
+          case SLEEPING:
+            sl_time += time_diff;
+            break;
+          default:
+            break;
+        }
+      }
+
+      release(&p->lock);
+
+      struct proc *mp = myproc();
+      if (copyout(mp->pagetable, running_time, (char *)&ri_time, sizeof(ri_time)) < 0 ||
+          copyout(mp->pagetable, runnable_time, (char *)&ra_time, sizeof(ra_time)) < 0 ||
+          copyout(mp->pagetable, sleep_time, (char *)&sl_time, sizeof(sl_time)) < 0)
+        return -1;
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
 // you must hold p->lock to call this function
-void update_state(struct proc *p, enum procstate newstate) {
-  // TODO
+void update_state(struct proc *p, enum procstate newstate, uint current_time) {
+  if (!holding(&p->lock)) panic("update_state p->lock");
+
+  uint time_diff = current_time - p->last_update_time;
+  switch (p->state) {
+    case RUNNING:
+      p->running_time += time_diff;
+      p->vruntime += time_diff * p->nice;
+      push_off();
+      __sync_fetch_and_add(&mycpu()->user_time, time_diff);
+      pop_off();
+      break;
+    case RUNNABLE:
+      p->runnable_time += time_diff;
+      break;
+    case SLEEPING:
+      p->sleep_time += time_diff;
+      break;
+    default:
+      break;
+  }
+  p->state = newstate;
+  p->last_update_time = current_time;
+}
+
+int cpustate(uint64 cpu_time) {
+  uint ct[NCPU] = {0};
+
+  acquire(&tickslock);
+  uint current_time = ticks;
+  release(&tickslock);
+
+  for (int cpu_id = 0; cpu_id < NCPU; cpu_id++) {
+    ct[cpu_id] = cpus[cpu_id].user_time;
+
+    struct proc *p = cpus[cpu_id].proc;
+    if (p != 0) {
+      acquire(&p->lock);
+      if (p->state == RUNNING) {
+        uint time_diff = current_time - p->last_update_time;
+        ct[cpu_id] += time_diff;
+      }
+      release(&p->lock);
+    }
+  }
+
+  if (copyout(myproc()->pagetable, cpu_time, (char *)ct, sizeof(ct)) < 0) return -1;
+  return 0;
+}
+
+static void heapify_up(int index) {
+  while (index > 0 && runnable_heap[index]->vruntime < runnable_heap[(index - 1) / 2]->vruntime) {
+    int parent_index = (index - 1) / 2;
+    struct proc *temp = runnable_heap[index];
+    runnable_heap[index] = runnable_heap[parent_index];
+    runnable_heap[parent_index] = temp;
+    index = parent_index;
+  }
+}
+
+static void heapify_down(int index) {
+  int min_index = index;
+  while (1) {
+    int left_child = index * 2 + 1;
+    int right_child = index * 2 + 2;
+    if (left_child < heap_size && runnable_heap[left_child]->vruntime < runnable_heap[min_index]->vruntime)
+      min_index = left_child;
+    if (right_child < heap_size && runnable_heap[right_child]->vruntime < runnable_heap[min_index]->vruntime)
+      min_index = right_child;
+    if (min_index == index) break;
+    struct proc *temp = runnable_heap[index];
+    runnable_heap[index] = runnable_heap[min_index];
+    runnable_heap[min_index] = temp;
+    index = min_index;
+  }
+}
+
+static void heap_insert(struct proc *p) {
+  if (!holding(&heap_lock)) panic("heap_insert heap_lock");
+  if (heap_size > NPROC) panic("runnable heap full");
+  runnable_heap[heap_size++] = p;
+  total_runnable_weight += nice_to_weight[p->nice];
+  heapify_up(heap_size - 1);
+}
+
+static struct proc *heap_pop_min(void) {
+  if (!holding(&heap_lock)) panic("heap_pop_min heap_lock");
+  if (heap_size == 0) return 0;
+  struct proc *min_proc = runnable_heap[0];
+  total_runnable_weight -= nice_to_weight[min_proc->nice];
+  min_vruntime = min_proc->vruntime;
+  runnable_heap[0] = runnable_heap[--heap_size];
+  if (heap_size > 0) heapify_down(0);
+  return min_proc;
 }

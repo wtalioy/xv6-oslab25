@@ -81,3 +81,30 @@ uint64 sys_rename(void) {
   p->name[len] = '\0';
   return 0;
 }
+
+uint64 sys_pstate(void) {
+  int pid;
+  uint64 running_time, runnable_time, sleep_time;
+  if (argint(0, &pid) < 0 || argaddr(1, &running_time) < 0 || argaddr(2, &runnable_time) < 0 ||
+      argaddr(3, &sleep_time) < 0)
+    return -1;
+  return pstate(pid, running_time, runnable_time, sleep_time);
+}
+
+uint64 sys_cpustate(void) {
+  uint64 cpu_time;
+  if (argaddr(0, &cpu_time) < 0) return -1;
+  return cpustate(cpu_time);
+}
+
+uint64 sys_setnice(void) {
+  int nice;
+  if (argint(0, &nice) < 0) return -1;
+  if (nice < 1 || nice > 3) return -1;
+
+  struct proc *p = myproc();
+  int old_nice = p->nice;
+  p->nice = nice;
+  if (nice > old_nice) yield();
+  return 0;
+}

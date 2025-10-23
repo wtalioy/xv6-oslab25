@@ -164,6 +164,7 @@ UPROGS=\
 	$U/_zombie\
 	$U/_waittest\
 	$U/_exittest\
+	$U/_sleep\
 	$U/_stat \
 	$U/_schedtest\
 
